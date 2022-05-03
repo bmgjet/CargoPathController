@@ -5,7 +5,6 @@ using System.Collections.Generic;
 using System.Security.Cryptography;
 using System.Text;
 using UnityEngine;
-
 //Console Command
 //createcargopath "newname.map" minwaterdepth mindistancefromprefabs smoothing		- Creates and saves new map file with cargopath of these settings embeded
 //createcargopath "newname.map"														- Saves the currently loaded cargopath into a new mapfile
@@ -17,8 +16,7 @@ using UnityEngine;
 // /addcargopath nodeindex															- Adds at node at that index
 // /removecargopath nodeindex nodeindex												- Removes node at that index or all between 2 given indexes
 // /savecargopath "newmapname.map"													- Saves current cargopath into new mapfile
-// /blockcargopath																	- Changes Topology below player to what you have set to block cargo egrees
-
+// /blockcargopath blocksize														- Changes Topology below player to what you have set to block cargo egrees
 namespace Oxide.Plugins
 {
 	[Info("CargoPathController", "bmgjet", "0.0.1")]
@@ -26,39 +24,182 @@ namespace Oxide.Plugins
 
 	class CargoPathController : RustPlugin
 	{
+		public int StoppedSeconds = 60;
+		public bool AllowCargoCrash = true;
 		public int TopologyBaseBlock = TerrainTopology.OCEANSIDE;
+		public int TopologyBaseStop = TerrainTopology.MONUMENT;
+		public static CargoPathController plugin;
 		public string NewMapName;
 		public float MinWaterhDepth;
 		public float MinDistanceFromShore;
 		public int Smoothing;
-		private List<Vector3> NewPath = new List<Vector3>();
 		private Vector3 LastNode = Vector3.zero;
 		private Timer ViewPath;
+		private List<CargoMod> cargoships = new List<CargoMod>();
+		private bool OverRideSpawn = true;
+		private Coroutine pathgenerator;
 
-		private void Unload() { ServerMgr.Instance.StopAllCoroutines(); if (ViewPath != null) { ViewPath.Destroy(); } }
+		class CargoMod : FacepunchBehaviour
+		{
+			public CargoShip _cargoship;
+			public bool HasStopped = false;
+			public Timer topochecker;
+			public int LastNode = -1;
+			public void StopCargoShip(float seconds)
+			{
+				if (_cargoship == null) { return; }
+				LastNode = _cargoship.targetNodeIndex;
+                if (LastNode == -1) { LastNode = _cargoship.GetClosestNodeToUs(); }
+				_cargoship.targetNodeIndex = -1;
+				_cargoship.currentThrottle = 0;
+				_cargoship.Invoke(() => { if (_cargoship != null) { _cargoship.targetNodeIndex = LastNode; LastNode = -1; } }, seconds);
+			}
 
+			public void playexp(List<Vector3> ExPoint)
+            {
+				if (ExPoint != null && ExPoint.Count > 1)
+				{
+					plugin.RunEffect("assets/prefabs/tools/c4/effects/c4_explosion.prefab", null, ExPoint[0]);
+					plugin.RunEffect("assets/prefabs/npc/patrol helicopter/damage_effect_debris.prefab", null, ExPoint[1]);
+					ExPoint.RemoveAt(0);
+					ExPoint.RemoveAt(0);
+					plugin.timer.Once(0.5f, () => { playexp(ExPoint); });
+					return;
+				}
+				plugin.timer.Once(2f, () =>
+				{
+					foreach (BaseEntity b in _cargoship.children.ToArray())
+					{
+						if (b != null)
+						{
+							if (b is BasePlayer || b is LootableCorpse)
+							{
+								Vector3 oldpos = b.transform.position;
+								oldpos.y = 1;
+								b.SetParent(null, true, true);
+							}
+						}
+					}
+					plugin.NextFrame(() =>
+					{
+						if (!_cargoship.IsDestroyed) { _cargoship.Kill(); }
+					});
+				});
+			}
+
+			public void CrashCargo(int seconds, List<Vector3> bow)
+			{
+				if (_cargoship == null) { return; }
+				_cargoship.SetFlag(global::BaseEntity.Flags.Reserved8, true, false, true);
+				_cargoship.currentRadiation = 30f;
+				_cargoship.InvokeRepeating(new Action(_cargoship.UpdateRadiation), 5f, 0.5f);
+				plugin.timer.Once(seconds, () =>{if (bow != null){playexp(bow);}});
+			}
+
+			public Vector3 AllowedRandomPos()
+			{
+				if (_cargoship == null) { return TerrainMeta.RandomPointOffshore(); }
+				Vector3 newpos;
+				int randomnode = UnityEngine.Random.Range(0, TerrainMeta.Path.OceanPatrolFar.Count);
+				for (int i = randomnode; i < TerrainMeta.Path.OceanPatrolFar.Count - 1; i++)
+				{
+					newpos = TerrainMeta.Path.OceanPatrolFar[i];
+					newpos.y = TerrainMeta.WaterMap.GetHeight(newpos);
+					if (!TerrainMeta.TopologyMap.GetTopology(newpos, plugin.TopologyBaseBlock)) { return newpos; }
+				}
+				for (int i = 0; i < TerrainMeta.Path.OceanPatrolFar.Count - 1; i++)
+				{
+					newpos = TerrainMeta.Path.OceanPatrolFar[i];
+					newpos.y = TerrainMeta.WaterMap.GetHeight(newpos);
+					if (!TerrainMeta.TopologyMap.GetTopology(newpos, plugin.TopologyBaseBlock)) { return newpos; }
+				}
+				newpos = TerrainMeta.RandomPointOffshore();
+				newpos.y = TerrainMeta.WaterMap.GetHeight(newpos);
+				return newpos;
+			}
+			public void CargoTick()
+			{
+                if (_cargoship == null) { return; }
+				Vector3 bow = _cargoship.transform.position + (_cargoship.transform.forward * 70);
+				if (plugin.AllowCargoCrash)
+				{
+					if (!HasStopped && TerrainMeta.HeightMap.GetHeight(bow) >= 0.5f)
+					{
+						List<Vector3> ExpoPos = new List<Vector3>();
+						for (int i = 0; i <= 10; i++)
+						{
+							ExpoPos.Add(bow + (_cargoship.transform.forward * (-10 * i)) + (_cargoship.transform.right * 5));
+							ExpoPos.Add(bow + (_cargoship.transform.forward * (-10 * i)) + (_cargoship.transform.right * -5));
+						}
+						plugin.RunEffect("assets/prefabs/tools/c4/effects/c4_explosion.prefab", null, bow + (_cargoship.transform.right * 4));
+						plugin.RunEffect("assets/prefabs/npc/patrol helicopter/damage_effect_debris.prefab", null, bow + (_cargoship.transform.right * 4));
+						plugin.RunEffect("assets/prefabs/tools/c4/effects/c4_explosion.prefab", null, bow + (_cargoship.transform.right * -4));
+						plugin.RunEffect("assets/prefabs/npc/patrol helicopter/damage_effect_debris.prefab", null, bow + (_cargoship.transform.right * -4));
+						HasStopped = true;
+						StopCargoShip(70);
+						CrashCargo(60, ExpoPos);
+					}
+				}
+				if (!HasStopped && TerrainMeta.TopologyMap.GetTopology(_cargoship.transform.position, plugin.TopologyBaseStop))
+				{
+					HasStopped = true;
+					StopCargoShip(plugin.StoppedSeconds);
+				}
+			}
+		}
+
+		private void Init() { plugin = this; }
+		private void OnServerInitialized(bool initial) { if (initial) { DelayStaryUp(); } else { Startup(); } }
+		private void DelayStaryUp() { timer.Once(10f, () => { try { if (Rust.Application.isLoading) { DelayStaryUp(); return; } } catch { } Startup(); }); }
+		private void Startup(){foreach(BaseNetworkable b in BaseNetworkable.serverEntities.entityList.Values){if(b is CargoShip){ApplyCargoMod(b as CargoShip,true);}}}
+		private void Unload(){if (pathgenerator != null) { ServerMgr.Instance.StopCoroutine(pathgenerator); }if (ViewPath != null) { ViewPath.Destroy(); } foreach (CargoMod cm in cargoships) { if (cm.topochecker != null) { cm.topochecker.Destroy(); } if (cm._cargoship != null) { GameObject.Destroy(cm); } } plugin = null; }
 		private object OnCargoShipEgress(CargoShip cs)
 		{
 			if (cs != null)
 			{
 				if (TerrainMeta.TopologyMap.GetTopology(cs.transform.position, TopologyBaseBlock))
 				{
-					Timer CheckEgress = timer.Once(30f, () => { cs.StartEgress(); });
+					timer.Once(30f, () => { if (cs != null) { cs.StartEgress(); } });
 					return true;
 				}
+				foreach (CargoMod cm in cargoships) { if (cm._cargoship == cs) { cargoships.Remove(cm); if (cm.topochecker != null) { cm.topochecker.Destroy(); } GameObject.Destroy(cm); } }
+				List<BaseEntity> kill = new List<BaseEntity>();
+				foreach (BaseEntity b in cs.children.ToArray()){kill.Add(b);}
+				timer.Once(60, () =>
+				{
+					if (kill != null)
+						foreach (BaseEntity b in kill.ToArray())
+						{
+							if(b != null && !b.IsDestroyed)
+                            {
+								b.Kill();
+                            }
+						}
+				});
 			}
 			return null;
 		}
-
-		private void OnEntitySpawned(CargoShip cs) { if (cs != null) { cs.transform.position = DefaultRandomPos(); } }
-
+		private void OnEntitySpawned(CargoShip cs) { ApplyCargoMod(cs); }
+		
 		[ChatCommand("blockcargopath")]
 		private void blockcargopath(BasePlayer player, string command, string[] Args)
 		{
 			if (player.IsAdmin)
 			{
-				TerrainMeta.TopologyMap.SetTopology(player.transform.position, TopologyBaseBlock,20,2);
+				int blocksize = 50;
+				if (Args != null && Args.Length == 1) { blocksize = int.Parse(Args[0]); }
+				TerrainMeta.TopologyMap.SetTopology(player.transform.position, TopologyBaseBlock, blocksize, 2);
 				player.ChatMessage("Changed Topology here to " + TopologyBaseBlock.ToString());
+			}
+		}
+
+		[ChatCommand("overridecargopath")]
+		private void overridecargopath(BasePlayer player, string command, string[] Args)
+		{
+			if (player.IsAdmin)
+			{
+				OverRideSpawn = !OverRideSpawn;
+				player.ChatMessage("Override Cargo Spawn Location:" + OverRideSpawn);
 			}
 		}
 
@@ -161,6 +302,7 @@ namespace Oxide.Plugins
 							if (TerrainMeta.TopologyMap.GetTopology(vector, TopologyBaseBlock)) { player.SendConsoleCommand("ddraw.box", 2f, Color.red, pos, 25f); }
 							else { player.SendConsoleCommand("ddraw.sphere", 2f, Color.blue, pos, 25f); }
 							if (LastNode != Vector3.zero) { player.SendConsoleCommand("ddraw.line", 2f, Color.blue, pos, LastNode); }
+							if (TerrainMeta.TopologyMap.GetTopology(vector, TopologyBaseStop)) { player.SendConsoleCommand("ddraw.text", 2f, Color.red, pos, "<size=30>Stop Trigger</size>"); }
 							player.SendConsoleCommand("ddraw.text", 2f, Color.white, pos, "<size=30>" + nodeindex.ToString() + "</size>");
 							LastNode = pos;
 						}
@@ -178,7 +320,7 @@ namespace Oxide.Plugins
 		private void stopcargopath(ConsoleSystem.Arg arg)
 		{
 			if (!arg.IsAdmin) { return; }
-			ServerMgr.Instance.StopAllCoroutines();
+			if (pathgenerator != null) { ServerMgr.Instance.StopCoroutine(pathgenerator); }
 		}
 
 		[ConsoleCommand("createcargopath")]
@@ -200,8 +342,8 @@ namespace Oxide.Plugins
 					MinWaterhDepth = float.Parse(arg.Args[1]);
 					MinDistanceFromShore = float.Parse(arg.Args[2]);
 					Smoothing = int.Parse(arg.Args[3]);
-					ServerMgr.Instance.StopAllCoroutines();
-					ServerMgr.Instance.StartCoroutine(GenerateOceanPatrolPath());
+					if (pathgenerator != null){ServerMgr.Instance.StopCoroutine(pathgenerator);}
+					pathgenerator = ServerMgr.Instance.StartCoroutine(GenerateOceanPatrolPath());
 					return;
 				}
 			}
@@ -223,8 +365,8 @@ namespace Oxide.Plugins
 					MinWaterhDepth = float.Parse(args[1]);
 					MinDistanceFromShore = float.Parse(args[2]);
 					Smoothing = int.Parse(args[3]);
-					ServerMgr.Instance.StopAllCoroutines();
-					ServerMgr.Instance.StartCoroutine(GenerateOceanPatrolPath());
+					if (pathgenerator != null) { ServerMgr.Instance.StopCoroutine(pathgenerator); }
+					pathgenerator = ServerMgr.Instance.StartCoroutine(GenerateOceanPatrolPath());
 					return;
 				}
 			}
@@ -253,6 +395,19 @@ namespace Oxide.Plugins
 			player.ChatMessage("/savecargopath mapnewname (Saves current cargo path)");
 		}
 
+		private void ApplyCargoMod(CargoShip cs, bool reload = false)
+		{
+			if (cs != null)
+			{
+				if (cs.gameObject.HasComponent<CargoMod>()) { return; }
+				CargoMod newcargoship = cs.gameObject.AddComponent<CargoMod>();
+				newcargoship._cargoship = cs;
+				cargoships.Add(newcargoship);
+				if (OverRideSpawn && !reload) { cs.transform.position = newcargoship.AllowedRandomPos(); }
+				newcargoship.topochecker = timer.Every(1f, () => { newcargoship.CargoTick(); });
+			}
+		}
+
 		public int GetClosestNodeToUs(Vector3 position)
 		{
 			int result = 0;
@@ -270,20 +425,6 @@ namespace Oxide.Plugins
 			return result;
 		}
 
-		private Vector3 DefaultRandomPos()
-		{
-			Vector3 newpos;
-			for (int i = 0; i < 1000; i++)
-			{
-				newpos = TerrainMeta.Path.OceanPatrolFar.GetRandom();
-				newpos.y = TerrainMeta.WaterMap.GetHeight(newpos);
-				if (!TerrainMeta.TopologyMap.GetTopology(newpos, TopologyBaseBlock)) { return newpos; }
-			}
-			newpos = TerrainMeta.RandomPointOffshore();
-			newpos.y = TerrainMeta.WaterMap.GetHeight(newpos);
-			return newpos;
-		}
-
 		private void ClearMapDataPath()
 		{
 			string RustEditCargoPath = MapDataName(World.Serialization.world.prefabs.Count);
@@ -295,10 +436,9 @@ namespace Oxide.Plugins
 
 		private void UpdateMapTopologyDataPath()
 		{
-			string RustEditCargoPath = MapDataName(World.Serialization.world.prefabs.Count);
 			for (int i = World.Serialization.world.maps.Count - 1; i >= 0; i--)
 			{
-				if (World.Serialization.world.maps[i].name == "topology") 
+				if (World.Serialization.world.maps[i].name == "topology")
 				{
 					World.Serialization.world.maps[i].data = TerrainMeta.TopologyMap.ToByteArray();
 				}
@@ -336,49 +476,48 @@ namespace Oxide.Plugins
 				}
 			}
 		}
+		private void RunEffect(string name, BaseEntity entity = null, Vector3 position = new Vector3(), Vector3 offset = new Vector3())
+		{
+			if (entity != null) { Effect.server.Run(name, entity, 0, offset, position, null, true); return; }
+			Effect.server.Run(name, position, Vector3.up, null, true);
+		}
 
 		public IEnumerator GenerateOceanPatrolPath()
 		{
 			adminmessage("Creating a new path grid may take awhile");
 			float NextMessageTick = Time.time;
 			var checks = 0;
+			int limiterrate = 10000;
+			if (MinDistanceFromShore == 0) { limiterrate *= 5; }
+			if (MinWaterhDepth == 0) { limiterrate *= 2; }
 			var _instruction = ConVar.FPS.limit > 20 ? CoroutineEx.waitForSeconds(0.01f) : null;
-			float x = TerrainMeta.Size.x;
-			float num = x * 2f * 3.14159274f;
-			float num2 = 30f;
-			int num3 = Mathf.CeilToInt(num / num2);
+			int points = Mathf.CeilToInt(TerrainMeta.Size.x * 2f * 3.14159274f / 16); //30
 			List<Vector3> list = new List<Vector3>();
-			float num4 = x;
-			float y = 0f;
-			for (int i = 0; i < num3; i++)
+			for (int i = 0; i < points; i++)
 			{
-				float num5 = (float)i / (float)num3 * 360f;
-				list.Add(new Vector3(Mathf.Sin(num5 * 0.0174532924f) * num4, y, Mathf.Cos(num5 * 0.0174532924f) * num4));
+				float num5 = (float)i / (float)points * 360f;
+				list.Add(new Vector3(Mathf.Sin(num5 * 0.0174532924f) * TerrainMeta.Size.x, 0, Mathf.Cos(num5 * 0.0174532924f) * TerrainMeta.Size.x));
 			}
-			float d = 4f;
-			float num6 = 200f;
 			bool flag = true;
 			int num7 = 0;
 			while (num7 < ConVar.AI.ocean_patrol_path_iterations && flag)
 			{
 				flag = false;
-				for (int j = 0; j < num3; j++)
+				for (int j = 0; j < points; j++)
 				{
 					Vector3 vector = list[j];
-					int index = (j == 0) ? (num3 - 1) : (j - 1);
-					int index2 = (j == num3 - 1) ? 0 : (j + 1);
-					Vector3 b = list[index2];
-					Vector3 b2 = list[index];
+					int index = (j == 0) ? (points - 1) : (j - 1);
+					int index2 = (j == points - 1) ? 0 : (j + 1);
 					Vector3 origin = vector;
 					Vector3 normalized = (Vector3.zero - vector).normalized;
-					Vector3 vector2 = vector + normalized * d;
-					if (Vector3.Distance(vector2, b) <= num6 && Vector3.Distance(vector2, b2) <= num6)
+					Vector3 vector2 = vector + normalized * 4;
+					if (Vector3.Distance(vector2, list[index2]) <= 200 && Vector3.Distance(vector2, list[index]) <= 200)
 					{
 						bool flag2 = true;
 						int num8 = 16;
 						for (int k = 0; k < num8; k++)
 						{
-							if (++checks >= 10000)
+							if (++checks >= limiterrate)
 							{
 								if (NextMessageTick < Time.time)
 								{
@@ -388,20 +527,24 @@ namespace Oxide.Plugins
 								checks = 0;
 								yield return _instruction;
 							}
-							float num9 = (float)k / (float)num8 * 360f;
-							Vector3 normalized2 = new Vector3(Mathf.Sin(num9 * 0.0174532924f), y, Mathf.Cos(num9 * 0.0174532924f)).normalized;
-							Vector3 vector3 = vector2 + normalized2 * 1f;
-							Vector3 direction = normalized;
-							if (vector3 != Vector3.zero)
+							if (TerrainMeta.TopologyMap.GetTopology(vector2, TerrainTopology.MAINLAND)) { flag2 = false; break; }
+							if (MinWaterhDepth != 0)
 							{
-								direction = (vector3 - vector2).normalized;
+								if ((TerrainMeta.HeightMap.GetHeight(vector2) * -1) <= MinWaterhDepth) { flag2 = false; break; }
 							}
-							RaycastHit raycastHit;
-							if ((TerrainMeta.HeightMap.GetHeight(vector2) * -1) <= MinWaterhDepth) { flag2 = false; break; }
-							if (UnityEngine.Physics.SphereCast(origin, 3f, direction, out raycastHit, MinDistanceFromShore, 1218511105))
+							if (MinDistanceFromShore != 0)
 							{
-								flag2 = false;
-								break;
+								float num9 = (float)k / (float)num8 * 360f;
+								Vector3 normalized2 = new Vector3(Mathf.Sin(num9 * 0.0174532924f), 0, Mathf.Cos(num9 * 0.0174532924f)).normalized;
+								Vector3 vector3 = vector2 + normalized2 * 1f;
+								Vector3 direction = normalized;
+								if (vector3 != Vector3.zero) { direction = (vector3 - vector2).normalized; }
+								RaycastHit raycastHit;
+								if (UnityEngine.Physics.SphereCast(origin, 3f, direction, out raycastHit, MinDistanceFromShore, 1218511105))
+								{
+									flag2 = false;
+									break;
+								}
 							}
 						}
 						if (flag2)
@@ -414,7 +557,7 @@ namespace Oxide.Plugins
 								{
 									if (Vector3.Distance(bp.transform.position, vector2) < 1000)
 									{
-										bp.SendConsoleCommand("ddraw.sphere", 0.1f, Color.blue, vector2, 1f);
+										bp.SendConsoleCommand("ddraw.sphere", 0.01f, Color.blue, vector2, 1f);
 									}
 								}
 							}
@@ -428,22 +571,6 @@ namespace Oxide.Plugins
 			List<Vector3> list3 = list;
 			list = new List<Vector3>();
 			foreach (int index3 in list2) { list.Add(list3[index3]); }
-			for (int i = 0; i < list.Count - 1; i++)
-			{
-				try
-				{
-					float dis = Vector3.Distance(list[i], list[i + 1]);
-					for (int i2 = i + 2; i2 < list.Count - 1; i2++)
-					{
-						if (Vector3.Distance(list[i], list[i2]) <= dis)
-						{
-							list.RemoveRange(i + 1, i2 - i);
-							break;
-						}
-					}
-				}
-				catch { }
-			}
 			adminmessage("saving created grid " + list.Count.ToString());
 			TerrainMeta.Path.OceanPatrolFar = list;
 			SaveMap();
@@ -454,7 +581,6 @@ namespace Oxide.Plugins
 		{
 			List<byte> newdata = new List<byte>();
 			newdata.AddRange(Convert.FromBase64String("PD94bWwgdmVyc2lvbj0iMS4wIj8+CjxTZXJpYWxpemVkUGF0aExpc3QgeG1sbnM6eHNkPSJodHRwOi8vd3d3LnczLm9yZy8yMDAxL1hNTFNjaGVtYSIgeG1sbnM6eHNpPSJodHRwOi8vd3d3LnczLm9yZy8yMDAxL1hNTFNjaGVtYS1pbnN0YW5jZSI+CiAgPHZlY3RvckRhdGE+CiAgICA="));
-			
 			foreach (Vector3 vect in TerrainMeta.Path.OceanPatrolFar)
 			{
 				newdata.AddRange(Convert.FromBase64String("ICAgIDxWZWN0b3JEYXRhPg=="));

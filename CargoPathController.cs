@@ -1,14 +1,13 @@
-using ProtoBuf;
 using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Security.Cryptography;
-using System.Text;
 using UnityEngine;
 //Console Command
 //createcargopath "newname.map" minwaterdepth mindistancefromprefabs smoothing		- Creates and saves new map file with cargopath of these settings embeded
 //createcargopath "newname.map"														- Saves the currently loaded cargopath into a new mapfile
 //stopcargopath																		- Stops the cargo path generator
+//crashcargoship																	- Enables crash mode and sends cargo towards vector zero
 
 //Chat Commands
 // /createcargopath "newname.map"  minwaterdepth mindistancefromprefabs	smoothing	- Creates a new map file with cargopath of these settings embeded
@@ -17,17 +16,17 @@ using UnityEngine;
 // /removecargopath nodeindex nodeindex												- Removes node at that index or all between 2 given indexes
 // /savecargopath "newmapname.map"													- Saves current cargopath into new mapfile
 // /blockcargopath blocksize														- Changes Topology below player to what you have set to block cargo egrees
-// /crashcargoship																	- Enables crash mode and sends cargo towards vector zero
 // /overridecargopath																- Toggles the cargo spawn point override
 namespace Oxide.Plugins
 {
-	[Info("CargoPathController", "bmgjet", "0.0.2")]
+	[Info("CargoPathController", "bmgjet", "0.0.3")]
 	[Description("CargoPathController Tool")]
 
 	class CargoPathController : RustPlugin
 	{
 		public int StoppedSeconds = 60;
-		public bool AllowCargoCrash = false;
+		public int EgressKillDelay = 120;
+		public bool CrashInsteadOfEgrees = true;    //Crashes on land instead of leaving map on egress.
 		public int TopologyBaseBlock = TerrainTopology.OCEANSIDE;
 		public int TopologyBaseStop = TerrainTopology.MONUMENT;
 		public static CargoPathController plugin;
@@ -38,75 +37,87 @@ namespace Oxide.Plugins
 		private Vector3 LastNode = Vector3.zero;
 		private Timer ViewPath;
 		private List<CargoMod> cargoships = new List<CargoMod>();
-		private bool OverRideSpawn = true;
+		private bool OverRideSpawn = true;      //True will spawn cargo on its path on a node free of blocking.
 		private Coroutine pathgenerator;
+		private string c4 = "assets/prefabs/tools/c4/effects/c4_explosion.prefab";
+		private string debris = "assets/prefabs/npc/patrol helicopter/damage_effect_debris.prefab";
 
 		class CargoMod : FacepunchBehaviour
 		{
 			public CargoShip _cargoship;
 			public bool HasStopped = false;
-			public Timer topochecker;
+			public bool AllowCrash = false;
+			public Timer Tick;
 			public int LastNode = -1;
 			public List<ScientistNPC> NPCs = new List<ScientistNPC>();
 			public void StopCargoShip(float seconds)
-            {
-                if (_cargoship == null) { return; }
-                LastNode = _cargoship.targetNodeIndex;
-                if (LastNode == -1) { LastNode = _cargoship.GetClosestNodeToUs(); }
-                _cargoship.targetNodeIndex = -1;
-                _cargoship.currentThrottle = 0;
+			{
+				if (_cargoship == null) { return; }
+				LastNode = _cargoship.targetNodeIndex;
+				if (LastNode == -1) { LastNode = _cargoship.GetClosestNodeToUs(); }
+				_cargoship.targetNodeIndex = -1;
+				_cargoship.currentThrottle = 0;
 				_cargoship.Invoke(() => { if (_cargoship != null) { _cargoship.targetNodeIndex = LastNode; LastNode = -1; plugin.timer.Once(60f, () => { try { HasStopped = false; } catch { } }); } }, seconds);
 			}
 
 			public void CrashMe()
-            {
+			{
 				if (_cargoship == null) { return; }
 				_cargoship.targetNodeIndex = -1;
-				plugin.AllowCargoCrash = true;
+				AllowCrash = true;
 				UpdateMovement();
 			}
 
-			public void NPCDrown()
-            {
-				if(NPCs.Count < 1) { return; }
-				foreach(ScientistNPC npc in NPCs)
-                {
-					if (npc == null || npc.IsDestroyed) { continue;}
-					if(npc.IsAlive() && npc.transform.position.y < -2){npc.Hurt(30f);}
-                }
-				plugin.timer.Once(1.5f, () => { NPCDrown(); });
-            }
+			public void killme(float delay = 0)
+			{
+				plugin.timer.Once(delay, () =>
+				{
+					if (Tick != null) { Tick.Destroy(); }
+					if (_cargoship != null)
+					{
+						foreach (BaseEntity b in _cargoship.children.ToArray())
+						{
+							if (b != null && b.GetParentEntity() is CargoShip)
+							{
+								if (b is BasePlayer || b is LootableCorpse || b is BaseCorpse || b is PlayerCorpse)
+								{
+									Vector3 oldpos = b.transform.position;
+									oldpos.y = 1;
+									b.SetParent(null, true, true);
+									continue;
+								}
+								b.Kill();
+							}
+						}
+					}
+					plugin.NextFrame(() => { if (_cargoship != null && !_cargoship.IsDestroyed) { _cargoship.Kill(); } GameObject.Destroy(this); });
+				});
+			}
 
-			public void Sink()
-            {
+			private void NPCDrown()
+			{
+				if (NPCs.Count < 1) { return; }
+				foreach (ScientistNPC npc in NPCs)
+				{
+					if (npc == null || npc.IsDestroyed) { continue; }
+					if (npc.IsAlive() && npc.transform.position.y < -3) { npc.Kill(); }
+				}
+				plugin.timer.Once(1.5f, () => { NPCDrown(); });
+			}
+
+			private void Sink()
+			{
 				if (_cargoship != null && HasStopped)
 				{
 					if (NPCs.Count == 0) { foreach (BaseEntity b in _cargoship.children.ToArray()) { if (b is ScientistNPC) { NPCs.Add(b as ScientistNPC); } } NPCDrown(); }
 					_cargoship.transform.position += _cargoship.transform.up * -1f * Time.deltaTime;
 					_cargoship.Invoke(() => { Sink(); }, 0.02f);
-					if (_cargoship.transform.position.y <= -45)
-					{
-						plugin.timer.Once(1f, () =>
-						{
-							foreach (BaseEntity b in _cargoship.children.ToArray())
-							{
-								if (b != null)
-								{
-									if (b is BasePlayer || b is LootableCorpse)
-									{
-										Vector3 oldpos = b.transform.position;
-										oldpos.y = 1;
-										b.SetParent(null, true, true);
-									}
-								}
-							}
-							plugin.NextFrame(() => { if (!_cargoship.IsDestroyed) { _cargoship.Kill(); } });
-						});
-					}
+					if (_cargoship.transform.position.y <= -45) { plugin.timer.Once(1f, () => { killme(); }); }
 				}
 			}
 
-			public void UpdateMovement()
+			private
+				void UpdateMovement()
 			{
 				if (_cargoship != null && !HasStopped)
 				{
@@ -118,16 +129,16 @@ namespace Oxide.Plugins
 					_cargoship.currentThrottle = Mathf.Lerp(_cargoship.currentThrottle, Mathf.InverseLerp(0f, 1f, Vector3.Dot(_cargoship.transform.forward, normalized)), Time.deltaTime * 0.2f);
 					_cargoship.currentVelocity = _cargoship.transform.forward * (12f * _cargoship.currentThrottle);
 					_cargoship.transform.position += _cargoship.currentVelocity * Time.deltaTime;
-					_cargoship.Invoke(()=> { UpdateMovement(); },0.005f);
+					_cargoship.Invoke(() => { UpdateMovement(); }, 0.005f);
 				}
 			}
 
-			public void playexp(List<Vector3> ExPoint)
+			private void playexp(List<Vector3> ExPoint)
 			{
 				if (ExPoint != null && ExPoint.Count > 1)
 				{
-					plugin.RunEffect("assets/prefabs/tools/c4/effects/c4_explosion.prefab", null, ExPoint[0]);
-					plugin.RunEffect("assets/prefabs/npc/patrol helicopter/damage_effect_debris.prefab", null, ExPoint[1]);
+					plugin.RunEffect(plugin.c4, null, ExPoint[0]);
+					plugin.RunEffect(plugin.debris, null, ExPoint[1]);
 					ExPoint.RemoveAt(0);
 					ExPoint.RemoveAt(0);
 					plugin.timer.Once(0.5f, () => { playexp(ExPoint); });
@@ -170,11 +181,11 @@ namespace Oxide.Plugins
 			public void CargoTick()
 			{
 				if (_cargoship == null) { return; }
-				Vector3 bow = _cargoship.transform.position + (_cargoship.transform.forward * 81) + (_cargoship.transform.up * 1);
-				Vector3 port = _cargoship.transform.position + (_cargoship.transform.forward * 56) + (_cargoship.transform.right * 12);
-				Vector3 starboard = _cargoship.transform.position + (_cargoship.transform.forward * 56) + (_cargoship.transform.right * -12);
-				if (plugin.AllowCargoCrash)
+				if (AllowCrash)
 				{
+					Vector3 bow = _cargoship.transform.position + (_cargoship.transform.forward * 81) + (_cargoship.transform.up * 1);
+					Vector3 port = _cargoship.transform.position + (_cargoship.transform.forward * 56) + (_cargoship.transform.right * 12);
+					Vector3 starboard = _cargoship.transform.position + (_cargoship.transform.forward * 56) + (_cargoship.transform.right * -12);
 					if (!HasStopped && (TerrainMeta.HeightMap.GetHeight(bow) >= -0.5f || TerrainMeta.HeightMap.GetHeight(port) >= -0.5f || TerrainMeta.HeightMap.GetHeight(starboard) >= -0.5f))
 					{
 						List<Vector3> ExpoPos = new List<Vector3>();
@@ -183,10 +194,10 @@ namespace Oxide.Plugins
 							ExpoPos.Add(bow + (_cargoship.transform.forward * -32) + (_cargoship.transform.forward * (-10 * i)) + (_cargoship.transform.right * 6));
 							ExpoPos.Add(bow + (_cargoship.transform.forward * -32) + (_cargoship.transform.forward * (-10 * i)) + (_cargoship.transform.right * -6));
 						}
-						plugin.RunEffect("assets/prefabs/tools/c4/effects/c4_explosion.prefab", null, bow +(_cargoship.transform.forward * -7) + (_cargoship.transform.right * 4));
-						plugin.RunEffect("assets/prefabs/npc/patrol helicopter/damage_effect_debris.prefab", null, bow + (_cargoship.transform.forward * -7) + (_cargoship.transform.right * 4));
-						plugin.RunEffect("assets/prefabs/tools/c4/effects/c4_explosion.prefab", null, bow + (_cargoship.transform.forward * -7) + (_cargoship.transform.right * -4));
-						plugin.RunEffect("assets/prefabs/npc/patrol helicopter/damage_effect_debris.prefab", null, bow + (_cargoship.transform.forward * -7) + (_cargoship.transform.right * -4));
+						plugin.RunEffect(plugin.c4, null, bow + (_cargoship.transform.forward * -7) + (_cargoship.transform.right * 2));
+						plugin.RunEffect(plugin.debris, null, bow + (_cargoship.transform.forward * -7) + (_cargoship.transform.right * 2));
+						plugin.RunEffect(plugin.c4, null, bow + (_cargoship.transform.forward * -7) + (_cargoship.transform.right * -2));
+						plugin.RunEffect(plugin.debris, null, bow + (_cargoship.transform.forward * -7) + (_cargoship.transform.right * -2));
 						HasStopped = true;
 						CrashCargo(10, ExpoPos);
 					}
@@ -203,53 +214,78 @@ namespace Oxide.Plugins
 		private void OnServerInitialized(bool initial) { if (initial) { DelayStaryUp(); } else { Startup(); } }
 		private void DelayStaryUp() { timer.Once(10f, () => { try { if (Rust.Application.isLoading) { DelayStaryUp(); return; } } catch { } Startup(); }); }
 		private void Startup() { foreach (BaseNetworkable b in BaseNetworkable.serverEntities.entityList.Values) { if (b is CargoShip) { ApplyCargoMod(b as CargoShip, true); } } }
-		private void Unload() { if (pathgenerator != null) { ServerMgr.Instance.StopCoroutine(pathgenerator); } if (ViewPath != null) { ViewPath.Destroy(); } foreach (CargoMod cm in cargoships) { if (cm.topochecker != null) { cm.topochecker.Destroy(); } if (cm._cargoship != null) { GameObject.Destroy(cm); } } plugin = null; }
+		private void Unload() { if (pathgenerator != null) { ServerMgr.Instance.StopCoroutine(pathgenerator); } if (ViewPath != null) { ViewPath.Destroy(); } foreach (CargoMod cm in cargoships.ToArray()) { if (cm.Tick != null) { cm.Tick.Destroy(); } if (cm._cargoship != null) { GameObject.Destroy(cm); } } plugin = null; }
+		private void OnEntitySpawned(CargoShip cs) { if (cs != null) { ApplyCargoMod(cs); } }
 		private object OnCargoShipEgress(CargoShip cs)
 		{
 			if (cs != null)
 			{
-                if (TerrainMeta.TopologyMap.GetTopology(cs.transform.position, TopologyBaseBlock))
-                {
-                    timer.Once(30f, () => { if (cs != null) { cs.StartEgress(); } });
-                    return true;
-                }
-				foreach (CargoMod cm in cargoships) { if (cm._cargoship == cs) { cargoships.Remove(cm); if (cm.topochecker != null) { cm.topochecker.Destroy(); } GameObject.Destroy(cm); } }
-				List<BaseEntity> kill = new List<BaseEntity>();
-				foreach (BaseEntity b in cs.children.ToArray()) { kill.Add(b); }
-				timer.Once(60, () =>
+				if (TerrainMeta.TopologyMap.GetTopology(cs.transform.position, TopologyBaseBlock))
 				{
-					if (kill != null)
-						foreach (BaseEntity b in kill.ToArray())
+					timer.Once(30f, () => { if (cs != null) { cs.StartEgress(); } });
+					return true;
+				}
+				foreach (CargoMod cm in cargoships.ToArray())
+				{
+					if (cm._cargoship == cs)
+					{
+						cargoships.Remove(cm);
+						if (CrashInsteadOfEgrees)
 						{
-							if (b != null && !b.IsDestroyed)
-							{
-								b.Kill();
-							}
+							cm.CrashMe();
+							return true;
 						}
-				});
+						cm.killme(EgressKillDelay);
+						return null;
+					}
+				}
 			}
 			return null;
 		}
-		private void OnEntitySpawned(CargoShip cs) { ApplyCargoMod(cs); }
 
 		private object OnPlayerViolation(BasePlayer player, AntiHackType type, float amount)
 		{
 			if (player != null)
 			{
 				BaseEntity be = player.GetParentEntity();
-				if(be != null && be is CargoShip)
-                {
-					player.Hurt(30f);
-                }
+				if (be != null && be is CargoShip) { player.Hurt(30f); }
 				return false;
 			}
 			return null;
 		}
 
-		[ChatCommand("crashcargoship")]
-		private void crashcargoship(BasePlayer player, string command, string[] Args)
+		[ConsoleCommand("crashcargoship")]
+		private void crashcargoship(ConsoleSystem.Arg arg) { if (!arg.IsAdmin) { return; } foreach (CargoMod cm in cargoships) { if (cm._cargoship != null) { cm.CrashMe(); } } }
+		[ConsoleCommand("stopcargopath")]
+		private void stopcargopath(ConsoleSystem.Arg arg) { if (!arg.IsAdmin) { return; } if (pathgenerator != null) { ServerMgr.Instance.StopCoroutine(pathgenerator); } }
+
+		[ConsoleCommand("createcargopath")]
+		private void createcargopath(ConsoleSystem.Arg arg)
 		{
-			if (player.IsAdmin){foreach(CargoMod cm in cargoships){if (cm._cargoship != null){cm.CrashMe();}}}
+			if (!arg.IsAdmin) { return; }
+			if (arg.Args != null)
+			{
+				ClearMapDataPath();
+				if (arg.Args.Length == 1)
+				{
+					NewMapName = arg.Args[0];
+					SaveMap();
+					return;
+				}
+				if (arg.Args.Length == 4)
+				{
+					NewMapName = arg.Args[0];
+					MinWaterhDepth = float.Parse(arg.Args[1]);
+					MinDistanceFromShore = float.Parse(arg.Args[2]);
+					Smoothing = int.Parse(arg.Args[3]);
+					if (pathgenerator != null) { ServerMgr.Instance.StopCoroutine(pathgenerator); }
+					pathgenerator = ServerMgr.Instance.StartCoroutine(GenerateOceanPatrolPath());
+					return;
+				}
+			}
+			Puts("Incorrect args");
+			Puts("createcargopath mapnewname (Saves current native path)");
+			Puts("createcargopath mapnewname MinDepth minDistanceFromPrefabs smoothing (Creates New Native path with settings and saves it)");
 		}
 
 		[ChatCommand("blockcargopath")]
@@ -356,10 +392,7 @@ namespace Oxide.Plugins
 					return;
 				}
 				int distance = 2000;
-				if (Args != null && Args.Length == 1)
-				{
-					distance = int.Parse(Args[0]);
-				}
+				if (Args != null && Args.Length == 1) { distance = int.Parse(Args[0]); }
 				player.ChatMessage("Started Viewing Cargo Path");
 				ViewPath = timer.Every(2f, () =>
 				{
@@ -377,50 +410,11 @@ namespace Oxide.Plugins
 							player.SendConsoleCommand("ddraw.text", 2f, Color.white, pos, "<size=30>" + nodeindex.ToString() + "</size>");
 							LastNode = pos;
 						}
-						else
-						{
-							LastNode = Vector3.zero;
-						}
+						else { LastNode = Vector3.zero; }
 						nodeindex++;
 					}
 				});
 			}
-		}
-
-		[ConsoleCommand("stopcargopath")]
-		private void stopcargopath(ConsoleSystem.Arg arg)
-		{
-			if (!arg.IsAdmin) { return; }
-			if (pathgenerator != null) { ServerMgr.Instance.StopCoroutine(pathgenerator); }
-		}
-
-		[ConsoleCommand("createcargopath")]
-		private void createcargopath(ConsoleSystem.Arg arg)
-		{
-			if (!arg.IsAdmin) { return; }
-			if (arg.Args != null)
-			{
-				ClearMapDataPath();
-				if (arg.Args.Length == 1)
-				{
-					NewMapName = arg.Args[0];
-					SaveMap();
-					return;
-				}
-				if (arg.Args.Length == 4)
-				{
-					NewMapName = arg.Args[0];
-					MinWaterhDepth = float.Parse(arg.Args[1]);
-					MinDistanceFromShore = float.Parse(arg.Args[2]);
-					Smoothing = int.Parse(arg.Args[3]);
-					if (pathgenerator != null) { ServerMgr.Instance.StopCoroutine(pathgenerator); }
-					pathgenerator = ServerMgr.Instance.StartCoroutine(GenerateOceanPatrolPath());
-					return;
-				}
-			}
-			Puts("Incorrect args");
-			Puts("createcargopath mapnewname (Saves current native path)");
-			Puts("createcargopath mapnewname MinDepth minDistanceFromPrefabs smoothing (Creates New Native path with settings and saves it)");
 		}
 
 		[ChatCommand("createcargopath")]
@@ -465,7 +459,6 @@ namespace Oxide.Plugins
 			player.ChatMessage("Incorrect args");
 			player.ChatMessage("/savecargopath mapnewname (Saves current cargo path)");
 		}
-
 		private void ApplyCargoMod(CargoShip cs, bool reload = false)
 		{
 			if (cs != null)
@@ -475,7 +468,7 @@ namespace Oxide.Plugins
 				newcargoship._cargoship = cs;
 				cargoships.Add(newcargoship);
 				if (OverRideSpawn && !reload) { cs.transform.position = newcargoship.AllowedRandomPos(); }
-				newcargoship.topochecker = timer.Every(1f, () => { newcargoship.CargoTick(); });
+				newcargoship.Tick = timer.Every(1f, () => { newcargoship.CargoTick(); });
 			}
 		}
 
@@ -483,9 +476,9 @@ namespace Oxide.Plugins
 		{
 			int result = 0;
 			float num = float.PositiveInfinity;
-			for (int i = 0; i < global::TerrainMeta.Path.OceanPatrolFar.Count; i++)
+			for (int i = 0; i < TerrainMeta.Path.OceanPatrolFar.Count; i++)
 			{
-				Vector3 b = global::TerrainMeta.Path.OceanPatrolFar[i];
+				Vector3 b = TerrainMeta.Path.OceanPatrolFar[i];
 				float num2 = Vector3.Distance(position, b);
 				if (num2 < num)
 				{
@@ -519,7 +512,7 @@ namespace Oxide.Plugins
 		public void SaveMap()
 		{
 			UpdateMapTopologyDataPath();
-			MapData mapData = new MapData();
+			ProtoBuf.MapData mapData = new ProtoBuf.MapData();
 			mapData.name = MapDataName(World.Serialization.world.prefabs.Count);
 			mapData.data = Serialise();
 			World.Serialization.world.maps.Add(mapData);
@@ -611,7 +604,7 @@ namespace Oxide.Plugins
 								Vector3 direction = normalized;
 								if (vector3 != Vector3.zero) { direction = (vector3 - vector2).normalized; }
 								RaycastHit raycastHit;
-								if (UnityEngine.Physics.SphereCast(origin, 3f, direction, out raycastHit, MinDistanceFromShore, 1218511105))
+								if (Physics.SphereCast(origin, 3f, direction, out raycastHit, MinDistanceFromShore, 1218511105))
 								{
 									flag2 = false;
 									break;
@@ -656,9 +649,9 @@ namespace Oxide.Plugins
 			{
 				newdata.AddRange(Convert.FromBase64String("ICAgIDxWZWN0b3JEYXRhPg=="));
 				newdata.AddRange(Convert.FromBase64String("ICAgICAgPHg+"));
-				newdata.AddRange(Encoding.ASCII.GetBytes(vect.x.ToString()));
+				newdata.AddRange(System.Text.Encoding.ASCII.GetBytes(vect.x.ToString()));
 				newdata.AddRange(Convert.FromBase64String("PC94PgogICAgICA8eT4wPC95PgogICAgICA8ej4="));
-				newdata.AddRange(Encoding.ASCII.GetBytes(vect.z.ToString()));
+				newdata.AddRange(System.Text.Encoding.ASCII.GetBytes(vect.z.ToString()));
 				newdata.AddRange(Convert.FromBase64String("PC96PgogICAgPC9WZWN0b3JEYXRhPg=="));
 			}
 			newdata.AddRange(Convert.FromBase64String("CiAgPC92ZWN0b3JEYXRhPgo8L1NlcmlhbGl6ZWRQYXRoTGlzdD4="));

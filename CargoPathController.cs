@@ -248,7 +248,7 @@ namespace Oxide.Plugins
 			if (player != null)
 			{
 				BaseEntity be = player.GetParentEntity();
-				if (be != null && be is CargoShip) { player.Hurt(30f); }
+				if (be != null && be is CargoShip && type == AntiHackType.InsideTerrain) { player.Hurt(5f); }
 				return false;
 			}
 			return null;
